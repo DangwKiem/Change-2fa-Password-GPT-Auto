@@ -2,6 +2,20 @@
   'use strict';
 
   const state = { token: '', jobs: new Map(), filter: 'all', settings: {}, events: null, output: '', draftTimer: null, pendingLaunch: null, activeMode: 'check_only', selectedJob: null };
+  const rows = new Map();
+  const pendingActions = new Set();
+  let renderFrame = null;
+  let tableDirty = true;
+  let outputTimer = null;
+  let outputRequest = null;
+  let outputDirty = false;
+  let settingsWrites = Promise.resolve();
+  let pendingSettingsWrites = 0;
+  let logRequest = 0;
+  let selectedLogVersion = 0;
+  const ROW_FIELDS = ['email', 'mode', 'status', 'error', 'error_kind', 'account_state',
+    'plan', 'plan_source', 'plan_expires', 'is_trial', 'usage_summary', 'retryable',
+    'login_verified', 'rotated_pending_verify', 'retry_count', 'created_at'];
   const $ = (id) => document.getElementById(id);
   const statusLabels = { queued: 'ĐANG CHỜ', running: 'ĐANG CHẠY', success: 'THÀNH CÔNG', error: 'LỖI', cancelled: 'ĐÃ DỪNG' };
   const errorLabels = {
@@ -102,6 +116,7 @@
   function renderMode() {
     document.querySelectorAll('.mode-btn').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.mode === state.activeMode);
+      btn.setAttribute('aria-pressed', String(btn.dataset.mode === state.activeMode));
     });
   }
 
@@ -109,10 +124,8 @@
     updateEditor();
     clearTimeout(state.draftTimer);
     state.draftTimer = setTimeout(async () => {
-      state.settings['twofa.input_draft'] = $('combo-input').value;
       try {
-        const data = await api('/api/settings', { method: 'PUT', body: JSON.stringify(settingsPayload()) });
-        state.settings = data.settings;
+        await persistSettings({ input_draft: $('combo-input').value });
       } catch (error) {
         toast(`Không lưu được danh sách nháp: ${error.message}`, 'error');
       }
@@ -120,20 +133,22 @@
   }
 
   function counts() {
-    const jobs = [...state.jobs.values()];
-    const running = jobs.filter((job) => ['queued', 'running'].includes(job.status)).length;
-    const success = jobs.filter((job) => job.status === 'success').length;
-    const error = jobs.filter((job) => ['error', 'cancelled'].includes(job.status)).length;
-    const retryableErrors = jobs.filter((job) => ['error', 'cancelled'].includes(job.status) && job.retryable !== false).length;
-    $('metric-running').textContent = running;
-    $('metric-success').textContent = success;
-    $('metric-errors').textContent = error;
-    $('count-all').textContent = jobs.length;
-    $('count-running').textContent = running;
-    $('count-success').textContent = success;
-    $('count-error').textContent = error;
-    $('retry-failed-count').textContent = retryableErrors;
-    $('retry-failed').disabled = retryableErrors === 0;
+    let running = 0, success = 0, error = 0, retryableErrors = 0;
+    for (const job of state.jobs.values()) {
+      if (['queued', 'running'].includes(job.status)) running += 1;
+      if (job.status === 'success') success += 1;
+      if (['error', 'cancelled'].includes(job.status)) {
+        error += 1;
+        if (job.retryable !== false) retryableErrors += 1;
+      }
+    }
+    const values = { 'metric-running': running, 'metric-success': success, 'metric-errors': error,
+      'count-all': state.jobs.size, 'count-running': running, 'count-success': success,
+      'count-error': error, 'retry-failed-count': retryableErrors };
+    for (const [id, value] of Object.entries(values)) {
+      if ($(id).textContent !== String(value)) $(id).textContent = value;
+    }
+    $('retry-failed').disabled = retryableErrors === 0 || pendingActions.has('retry-all');
   }
 
   function filteredJobs() {
@@ -144,11 +159,33 @@
     return jobs;
   }
 
-  function render() {
+  function render(updateTable = true) {
+    tableDirty ||= updateTable;
+    if (renderFrame !== null) return;
+    renderFrame = requestAnimationFrame(() => {
+      renderFrame = null;
+      if (tableDirty) {
+        tableDirty = false;
+        renderJobs();
+      }
+      renderSelectedLog();
+    });
+  }
+
+  function renderJobs() {
     counts();
     const jobs = filteredJobs();
     $('empty-state').style.display = jobs.length ? 'none' : 'grid';
-    $('job-list').innerHTML = jobs.map((job) => {
+    const visible = new Set(jobs.map((job) => job.id));
+    for (const [id, cached] of rows) {
+      if (!visible.has(id)) {
+        cached.node.remove();
+        rows.delete(id);
+      }
+    }
+    const tbody = $('job-list');
+    let cursor = tbody.firstElementChild;
+    for (const job of jobs) {
       const check = accountCheck(job);
       const modeShort = (MODE_LABELS[job.mode] || { short: job.mode.toUpperCase() }).short;
       const checkpoint = job.mode === 'check_only' && job.status === 'success'
@@ -160,8 +197,7 @@
             : check.detail;
       const canRetry = ['error', 'cancelled'].includes(job.status) && job.retryable !== false;
       const canStop = ['queued', 'running'].includes(job.status);
-      const selected = state.selectedJob === job.id ? ' selected' : '';
-      return `<tr data-id="${job.id}" class="job-row${selected}" title="${escapeHtml(job.error || '')}">
+      const markup = `
         <td class="account"><strong>${escapeHtml(job.email)}</strong><span>${job.id.slice(0, 10).toUpperCase()} · <b class="job-mode mode-${job.mode}">${escapeHtml(modeShort)}</b></span></td>
         <td><span class="status ${job.status} ${job.plan ? `plan-${escapeHtml(job.plan)}` : ''} ${job.is_trial ? 'is-trial' : ''}">${escapeHtml(statusLabel(job))}</span></td>
         <td><div class="account-result"><span class="account-badge ${check.className}">${escapeHtml(check.label)}</span><small>${escapeHtml(checkpoint)}</small></div></td>
@@ -170,8 +206,30 @@
           ${canRetry ? '<button class="action-btn retry-btn" data-action="retry">↻ Retry</button>' : ''}
           ${canStop ? '<button class="action-btn stop-btn" data-action="stop">■ Dừng</button>' : ''}
           ${!canStop ? '<button class="action-btn delete-btn" data-action="delete">× Xóa</button>' : ''}
-        </div></td></tr>`;
-    }).join('');
+        </div></td>`;
+      let cached = rows.get(job.id);
+      if (!cached) {
+        const node = document.createElement('tr');
+        node.dataset.id = job.id;
+        node.className = 'job-row';
+        cached = { node, markup: null };
+        rows.set(job.id, cached);
+      }
+      if (cached.markup !== markup) {
+        cached.node.innerHTML = markup;
+        cached.markup = markup;
+      }
+      const title = job.error || '';
+      if (cached.node.title !== title) cached.node.title = title;
+      cached.node.classList.toggle('selected', state.selectedJob === job.id);
+      const selected = String(state.selectedJob === job.id);
+      if (cached.node.getAttribute('aria-selected') !== selected) cached.node.setAttribute('aria-selected', selected);
+      cached.node.querySelectorAll('button').forEach((button) => {
+        button.disabled = pendingActions.has(`job:${job.id}`);
+      });
+      if (cached.node !== cursor) tbody.insertBefore(cached.node, cursor);
+      cursor = cached.node.nextElementSibling;
+    }
   }
 
   function escapeHtml(value) {
@@ -180,7 +238,8 @@
 
   function renderOutput() {
     const lines = state.output.trim() ? state.output.trim().split(/\r?\n/) : [];
-    $('success-output').value = lines.join('\n');
+    const value = lines.join('\n');
+    if ($('success-output').value !== value) $('success-output').value = value;
     $('output-count').textContent = `${lines.length} tài khoản`;
     $('output-empty').style.display = lines.length ? 'none' : 'flex';
     $('success-output').style.visibility = lines.length ? 'visible' : 'hidden';
@@ -188,12 +247,64 @@
     $('export-output').disabled = !lines.length;
   }
 
-  async function refreshOutput() {
+  function scheduleOutputRefresh() {
+    outputDirty = true;
+    if (outputRequest || outputTimer !== null) return;
+    outputTimer = setTimeout(refreshOutput, 120);
+  }
+
+  function refreshOutput() {
+    clearTimeout(outputTimer);
+    outputTimer = null;
+    outputDirty = true;
+    if (outputRequest) return outputRequest;
+    outputRequest = (async () => {
+      try {
+        do {
+          outputDirty = false;
+          const output = await api('/api/output');
+          // A newer event arrived while fetching: do not display stale results.
+          if (!outputDirty) {
+            state.output = output;
+            renderOutput();
+          }
+        } while (outputDirty);
+      } catch (error) {
+        toast(`Không tải được output: ${error.message}`, 'error');
+      } finally {
+        outputRequest = null;
+      }
+    })();
+    return outputRequest;
+  }
+
+  function contributesOutput(job) {
+    return job?.status === 'success' && job.login_verified && job.mode !== 'check_only';
+  }
+
+  function setJob(job) {
+    const previous = state.jobs.get(job.id);
+    if (!previous || ROW_FIELDS.some((key) => previous[key] !== job[key])) tableDirty = true;
+    state.jobs.set(job.id, job);
+    if (contributesOutput(previous) !== contributesOutput(job)) scheduleOutputRefresh();
+    if (state.selectedJob === job.id) selectedLogVersion += 1;
+  }
+
+  async function withBusy(key, button, action) {
+    if (pendingActions.has(key)) return;
+    pendingActions.add(key);
+    if (button) {
+      button.disabled = true;
+      button.setAttribute('aria-busy', 'true');
+    }
     try {
-      state.output = await api('/api/output');
-      renderOutput();
-    } catch (error) {
-      toast(`Không tải được output: ${error.message}`, 'error');
+      return await action();
+    } finally {
+      pendingActions.delete(key);
+      if (button?.isConnected) {
+        button.disabled = false;
+        button.removeAttribute('aria-busy');
+      }
     }
   }
 
@@ -240,25 +351,35 @@
     $('launch-batch').disabled = true;
     try {
       const data = await api('/api/jobs', { method: 'POST', body: JSON.stringify({ lines, mode }) });
-      data.jobs.forEach((job) => state.jobs.set(job.id, job));
+      data.jobs.forEach(setJob);
       render();
       const info = MODE_LABELS[mode] || { title: mode };
       toast(`Đã nạp ${data.jobs.length} tài khoản — ${info.title}.`);
-      $('queue').scrollIntoView({ behavior: 'smooth' });
+      scrollToSection('queue');
     } catch (error) { toast(error.message, 'error'); }
     finally { $('launch-batch').disabled = false; }
   }
 
   async function jobAction(id, action) {
+    if (pendingActions.has(`job:${id}`)) return;
     try {
       if (action === 'logs') return openLogs(id);
-      if (action === 'retry' || action === 'stop') {
-        const data = await api(`/api/jobs/${id}/${action}`, { method: 'POST' });
-        state.jobs.set(id, data.job); render();
-      } else if (action === 'delete') {
-        await api(`/api/jobs/${id}`, { method: 'DELETE' });
-        state.jobs.delete(id); render();
-      }
+      await withBusy(`job:${id}`, null, async () => {
+        const row = rows.get(id)?.node;
+        row?.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+        try {
+          if (action === 'retry' || action === 'stop') {
+            const data = await api(`/api/jobs/${id}/${action}`, { method: 'POST' });
+            setJob(data.job); render();
+          } else if (action === 'delete') {
+            await api(`/api/jobs/${id}`, { method: 'DELETE' });
+            if (contributesOutput(state.jobs.get(id))) scheduleOutputRefresh();
+            state.jobs.delete(id); render();
+          }
+        } finally {
+          row?.querySelectorAll('button').forEach((button) => { button.disabled = false; });
+        }
+      });
     } catch (error) { toast(error.message, 'error'); }
   }
 
@@ -270,6 +391,8 @@
       return;
     }
     state.selectedJob = id;
+    const request = ++logRequest;
+    const version = selectedLogVersion;
     render();
     const panel = $('inline-log-panel');
     panel.style.display = 'flex';
@@ -278,12 +401,37 @@
     $('inline-log-content').textContent = 'Đang tải log...';
     try {
       const data = await api(`/api/jobs/${id}/logs`);
-      $('inline-log-content').textContent = data.logs.join('\n') || 'Chưa có log.';
-      $('inline-log-content').scrollTop = $('inline-log-content').scrollHeight;
-    } catch (error) { $('inline-log-content').textContent = error.message; }
+      if (state.selectedJob !== id || request !== logRequest || version !== selectedLogVersion) return;
+      job.logs = data.logs;
+      updateLogText(data.logs, true);
+    } catch (error) {
+      if (state.selectedJob === id && request === logRequest && version === selectedLogVersion) {
+        $('inline-log-content').textContent = error.message;
+      }
+    }
+  }
+
+  function updateLogText(logs, forceScroll = false) {
+    const content = $('inline-log-content');
+    const text = logs.join('\n') || 'Chưa có log.';
+    if (content.textContent === text) return;
+    const follow = forceScroll || content.scrollHeight - content.scrollTop - content.clientHeight < 40;
+    const scrollTop = content.scrollTop;
+    content.textContent = text;
+    content.scrollTop = follow ? content.scrollHeight : scrollTop;
+  }
+
+  function renderSelectedLog() {
+    if (!state.selectedJob) return;
+    const job = state.jobs.get(state.selectedJob);
+    if (!job) return closeInlineLog();
+    const markup = `<span class="status ${job.status}">${escapeHtml(statusLabel(job))}</span>`;
+    if ($('inline-log-status').innerHTML !== markup) $('inline-log-status').innerHTML = markup;
+    if (Array.isArray(job.logs)) updateLogText(job.logs);
   }
 
   function closeInlineLog() {
+    logRequest += 1;
     $('inline-log-panel').style.display = 'none';
     state.selectedJob = null;
     render();
@@ -323,6 +471,20 @@
     };
   }
 
+  function persistSettings(patch) {
+    const draft = $('combo-input').value;
+    pendingSettingsWrites += 1;
+    const write = settingsWrites.then(async () => {
+      const payload = { ...settingsPayload(), input_draft: draft, ...patch };
+      const data = await api('/api/settings', { method: 'PUT', body: JSON.stringify(payload) });
+      state.settings = data.settings;
+      return data.settings;
+    });
+    const settled = write.finally(() => { pendingSettingsWrites -= 1; });
+    settingsWrites = settled.catch(() => {});
+    return settled;
+  }
+
   async function saveQuickConcurrency() {
     const input = $('quick-concurrency');
     const value = Number(input.value);
@@ -330,10 +492,8 @@
       input.value = state.settings['twofa.max_concurrent'];
       throw new Error('Số luồng phải từ 1 đến 10.');
     }
-    if (value === Number(state.settings['twofa.max_concurrent'])) return;
-    const data = await api('/api/settings', { method: 'PUT', body: JSON.stringify(settingsPayload(value)) });
-    state.settings = data.settings;
-    loadSettingsForm();
+    if (value === Number(state.settings['twofa.max_concurrent']) && pendingSettingsWrites === 0) return;
+    await persistSettings({ max_concurrent: value });
     toast(`Đã đổi sang ${value} luồng chạy đồng thời.`);
   }
 
@@ -347,7 +507,7 @@
       for (const job of failed) {
         try {
           const data = await api(`/api/jobs/${job.id}/retry`, { method: 'POST' });
-          state.jobs.set(job.id, data.job);
+          setJob(data.job);
           retried += 1;
           render();
         } catch (error) {
@@ -362,21 +522,23 @@
 
   async function saveSettings(event) {
     event.preventDefault();
-    try {
-      const payload = {
-        max_concurrent: Number($('setting-concurrency').value),
-        job_timeout: Number($('setting-timeout').value),
-        auto_retry: $('setting-auto-retry').checked,
-        auto_retry_max: Number($('setting-retry-max').value),
-        auto_retry_delay: Number($('setting-retry-delay').value),
-        change_enabled: Boolean(state.settings['twofa.change_enabled']),
-        input_draft: $('combo-input').value,
-      };
-      const data = await api('/api/settings', { method: 'PUT', body: JSON.stringify(payload) });
-      state.settings = data.settings;
-      loadSettingsForm();
-      closeDrawers(); toast('Đã lưu cấu hình runtime vào SQLite.');
-    } catch (error) { toast(error.message, 'error'); }
+    if (pendingActions.has('settings')) return;
+    await withBusy('settings', $('save-settings'), async () => {
+      try {
+        const payload = {
+          max_concurrent: Number($('setting-concurrency').value),
+          job_timeout: Number($('setting-timeout').value),
+          auto_retry: $('setting-auto-retry').checked,
+          auto_retry_max: Number($('setting-retry-max').value),
+          auto_retry_delay: Number($('setting-retry-delay').value),
+          change_enabled: Boolean(state.settings['twofa.change_enabled']),
+          input_draft: $('combo-input').value,
+        };
+        await persistSettings(payload);
+        loadSettingsForm();
+        closeDrawers(); toast('Đã lưu cấu hình runtime vào SQLite.');
+      } catch (error) { toast(error.message, 'error'); }
+    });
   }
 
   async function exportOutput() {
@@ -398,17 +560,18 @@
     state.events.onmessage = ({ data }) => {
       const payload = JSON.parse(data);
       if (payload.type === 'snapshot') {
+        tableDirty = true;
         state.jobs.clear(); payload.jobs.forEach((job) => state.jobs.set(job.id, job));
+        selectedLogVersion += 1;
+        scheduleOutputRefresh();
       } else if (payload.type === 'job') {
-        state.jobs.set(payload.job.id, payload.job);
-        if (state.selectedJob === payload.job.id && Array.isArray(payload.job.logs)) {
-          $('inline-log-content').textContent = payload.job.logs.join('\n') || 'Chưa có log.';
-          $('inline-log-status').innerHTML = `<span class="status ${payload.job.status}">${escapeHtml(statusLabel(payload.job))}</span>`;
-          $('inline-log-content').scrollTop = $('inline-log-content').scrollHeight;
-        }
-      } else if (payload.type === 'removed') state.jobs.delete(payload.id);
-      render();
-      refreshOutput();
+        setJob(payload.job);
+      } else if (payload.type === 'removed') {
+        tableDirty = true;
+        if (contributesOutput(state.jobs.get(payload.id))) scheduleOutputRefresh();
+        state.jobs.delete(payload.id);
+      }
+      render(false);
     };
   }
 
@@ -420,6 +583,10 @@
       data.jobs.forEach((job) => state.jobs.set(job.id, job));
       loadSettingsForm(); updateEditor(); render(); renderOutput(); connectEvents(); await refreshOutput();
     } catch (_) { $('connection-label').textContent = 'SERVER OFFLINE'; toast('Không kết nối được localhost :5033', 'error'); }
+  }
+
+  function scrollToSection(id) {
+    $(id).scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' });
   }
 
   $('combo-input').addEventListener('input', scheduleDraftSave);
@@ -434,11 +601,16 @@
     try { await saveQuickConcurrency(); } catch (error) { toast(error.message, 'error'); }
   });
   $('launch-batch').addEventListener('click', async () => {
-    try { await saveQuickConcurrency(); openLaunchConfirmation(); } catch (error) { toast(error.message, 'error'); }
+    await withBusy('prepare-launch', $('launch-batch'), async () => {
+      try { await saveQuickConcurrency(); openLaunchConfirmation(); } catch (error) { toast(error.message, 'error'); }
+    });
   });
   $('confirm-launch').addEventListener('click', launch);
   $('cancel-launch').addEventListener('click', () => { state.pendingLaunch = null; $('launch-confirm').close(); });
-  $('retry-failed').addEventListener('click', retryFailed);
+  $('retry-failed').addEventListener('click', async () => {
+    await withBusy('retry-all', $('retry-failed'), retryFailed);
+    render();
+  });
   $('job-list').addEventListener('click', (event) => {
     const button = event.target.closest('[data-action]');
     const row = event.target.closest('tr');
@@ -450,14 +622,18 @@
     document.querySelectorAll('.filter').forEach((item) => item.classList.remove('active'));
     button.classList.add('active'); state.filter = button.dataset.filter; render();
   }));
-  document.querySelectorAll('[data-target]').forEach((button) => button.addEventListener('click', () => $(button.dataset.target).scrollIntoView({ behavior: 'smooth' })));
+  document.querySelectorAll('[data-target]').forEach((button) => button.addEventListener('click', () => scrollToSection(button.dataset.target)));
   $('open-settings').addEventListener('click', () => { loadSettingsForm(); openDrawer('settings-drawer'); });
   $('close-detail').addEventListener('click', closeDrawers); $('close-settings').addEventListener('click', closeDrawers); $('drawer-backdrop').addEventListener('click', closeDrawers);
   $('settings-form').addEventListener('submit', saveSettings);
   $('copy-output').addEventListener('click', copyOutput);
   $('export-output').addEventListener('click', exportOutput);
-  $('nav-output').addEventListener('click', () => $('output-panel').scrollIntoView({ behavior: 'smooth' }));
-  $('stop-all').addEventListener('click', async () => { try { await api('/api/jobs/stop-all', { method: 'POST' }); toast('Đã gửi lệnh dừng toàn bộ.'); } catch (error) { toast(error.message, 'error'); } });
-  $('clear-all').addEventListener('click', async () => { try { await api('/api/jobs', { method: 'DELETE' }); state.jobs.clear(); render(); await refreshOutput(); toast('Đã dọn danh sách.'); } catch (error) { toast(error.message, 'error'); } });
+  $('nav-output').addEventListener('click', () => scrollToSection('output-panel'));
+  $('stop-all').addEventListener('click', () => withBusy('stop-all', $('stop-all'), async () => {
+    try { await api('/api/jobs/stop-all', { method: 'POST' }); toast('Đã gửi lệnh dừng toàn bộ.'); } catch (error) { toast(error.message, 'error'); }
+  }));
+  $('clear-all').addEventListener('click', () => withBusy('clear-all', $('clear-all'), async () => {
+    try { await api('/api/jobs', { method: 'DELETE' }); state.jobs.clear(); render(); await refreshOutput(); toast('Đã dọn danh sách.'); } catch (error) { toast(error.message, 'error'); }
+  }));
   updateEditor(); renderOutput(); init();
 })();

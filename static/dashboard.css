@@ -73,8 +73,7 @@
 .job-row.selected td:first-child{padding-left:8px}
 
 /* Queue body — grid chứa table + inline log */
-.queue-body{display:grid;grid-template-columns:1fr;align-items:start;gap:0;overflow:visible;transition:grid-template-columns .2s}
-.queue-body:has(.inline-log-panel[style*="flex"]){grid-template-columns:1fr 340px}
+.queue-body{display:grid;grid-template-columns:minmax(0,1fr);align-items:start;gap:0;overflow:visible}
 
 /* Inline log panel */
 .inline-log-panel{position:fixed;top:12px;right:24px;z-index:35;width:min(340px,calc(100vw - 48px));height:min(400px,calc(100vh - 24px));max-height:calc(100vh - 24px);flex-direction:column;border:1px solid var(--line-strong);border-radius:12px;background:rgba(8,24,40,.97);box-shadow:0 18px 48px rgba(1,12,22,.42);overflow:hidden}
@@ -88,5 +87,52 @@
 /* Responsive */
 @media(max-width:900px){.launch-row{flex-wrap:wrap}.mode-selector{flex:none;width:100%}}
 @media(max-width:680px){.mode-btn{font-size:.6rem;height:34px;gap:4px}}
+
+/* Keep scrolling/realtime updates cheap without changing the dashboard theme. */
+:root{--font-ui:"Segoe UI",system-ui,-apple-system,BlinkMacSystemFont,Arial,sans-serif}
+body,.eyebrow,.counter,.status,th,footer,.section-head h2,.drawer h2,.empty-state h3,.brand-copy h1,h1,h2,h3,.metric strong,.inline-log-head h3{font-family:var(--font-ui)}
+.ambient{filter:none;background:radial-gradient(circle,rgba(33,143,231,.22),transparent 70%);opacity:.6}
+.ambient-b{background:radial-gradient(circle,rgba(32,206,221,.16),transparent 70%)}
+.glass,.rail{backdrop-filter:none}
+.glass{box-shadow:0 8px 24px rgba(2,14,25,.2)}
+.launch-modal::backdrop{backdrop-filter:none}
+.table-wrap{min-width:0;height:auto;max-height:65vh;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+.table-wrap thead th{position:sticky;top:0;z-index:1;background:#10314a}
+.inline-log-panel pre{overscroll-behavior:contain;overflow-anchor:none}
+.launch-row{flex-wrap:wrap}
+.mode-selector{flex-basis:100%}
+.launch-controls{margin-left:auto}
+.filter{white-space:nowrap;flex:none}
+.queue-head{height:auto;min-height:42px;flex-wrap:wrap}
+.queue-tools{flex-wrap:wrap}
+.metric strong{font-variant-numeric:tabular-nums}
+button{transition-property:background-color,border-color,color,opacity,transform;transition-duration:.15s}
+button:disabled{cursor:default;opacity:.55}
+button[aria-busy="true"]{cursor:progress}
+button:focus-visible,a:focus-visible{outline:2px solid var(--cyan);outline-offset:3px}
+.drawer{transition-property:transform,opacity;transition-duration:.2s}
+.toast-stack{pointer-events:none}
+@media(max-width:1100px){.queue-section{height:auto;min-height:300px}.table-wrap{max-height:60vh;min-height:160px}}
+@media(max-width:680px){
+  .topbar{flex-wrap:wrap;gap:12px}
+  .brand-copy{min-width:0}
+  .brand-copy h1{font-size:1.35rem;line-height:1.2}
+  .composer,.output-card{height:auto;min-height:360px}
+  .editor-wrap,.output-wrap{min-height:160px}
+  .launch-row{width:100%;min-width:0}
+  .mode-selector{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .mode-btn{font-size:.72rem;height:38px}
+  .launch-controls{min-width:0;flex-wrap:nowrap}
+  .concurrency-control{flex:0 0 auto;padding-left:8px;gap:5px}
+  .composer-foot .launch-controls .button{flex:1;width:auto;min-width:0}
+  .queue-tools{width:100%;gap:6px}
+  .queue-tools .button{flex:1;white-space:nowrap;padding-inline:8px}
+  .queue-section{height:auto;min-height:300px}
+  .inline-log-panel{top:auto;bottom:74px;right:12px;width:calc(100vw - 24px);height:min(400px,55dvh)}
+}
+@media(prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}
+}
 
 
